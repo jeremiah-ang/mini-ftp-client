@@ -8,14 +8,20 @@
 #include <stdlib.h> 
 #include <netdb.h>
 #include <unistd.h>
+#include <regex>
+using namespace std;
 
 #define ERROR_MSG_NO_CONNECTION "No Connection Established"
+#define MSG_RECONNECTING "Connection Closed, reconnecting..."
 #define CRLF "\r\n"
 #define SERVER_ADDR "ftp.ietf.org"
 
-using namespace std;
+void connect();
+string sendMessageToServer(string snd_data);
+void setupSockets(int *client_socket, sockaddr_in *server_socket, string server_addr, int server_port);
 
-string connected_server = "";
+
+string connected_server = "", email = "e0032087@u.nus.edu";
 int client_socket = -1;
 
 string requestInput(string msg) {
@@ -26,6 +32,15 @@ string requestInput(string msg) {
 
 void error(string error_msg) {
 	cout << error_msg << endl;
+}
+
+void getResponseCode(const char *rcv_data, char *response_code) {
+	strncpy(response_code, rcv_data, 3);
+}
+
+int hasResponseCode(const char *rcv_data, string response_code_match) {
+	char response_code[3] = ""; getResponseCode(rcv_data, response_code);
+	return (!strncmp(response_code, response_code_match.c_str(), 3)) ? 1 : 0;
 }
 
 // Create client socket
@@ -48,12 +63,13 @@ sockaddr_in setupServerSocket(int server_port, string server_ip) {
 }
 
 // Connect to server's socket
-void connectToServerSocket(int client_socket, sockaddr_in server_sock) {
+int connectToServerSocket(int client_socket, sockaddr_in server_sock) {
 	int connection = connect(client_socket, (struct sockaddr *)&server_sock, sizeof(struct sockaddr));
 	if (connection < 0) {
 		perror("Connect");
-		exit(1);
+		return 0;
 	}
+	return 1;
 }
 
 // Get IP Address of Server
@@ -77,19 +93,34 @@ string getServerIp(string server_addr) {
 }
 
 int connectToFtpServer(int client_socket, sockaddr_in server_socket) {
-	connectToServerSocket(client_socket, server_socket);
-	char rcv_data[1024];
+	if(!connectToServerSocket(client_socket, server_socket)) return 0;
+	char rcv_data[1024] = "";
 	recv(client_socket, rcv_data, 1024, 0);
 
-	char connection_status[3];
-	strncpy(connection_status, rcv_data, 3);
-	if (strcmp(connection_status, "220")) {
+	if (hasResponseCode(rcv_data, "220")) {
 		cout << "Successfully Connected to FTP Server! Response: " << rcv_data << endl;
 		return 1;
 	} else {
-		cout << "Failed to connect to FTP Server! Error Code: " << connection_status << endl;
+		cout << "Failed to connect to FTP Server! Response: " << rcv_data << endl;
 		return 0;
 	}
+}
+
+void handleRcvData(string rcv_data, string snd_data) {
+	cout << requestInput(string("ftp >> ") + rcv_data);
+	if(hasResponseCode(rcv_data.c_str(), "421")) {
+		// connection closed
+		cout << MSG_RECONNECTING << endl;
+		connect();
+		sendMessageToServer(snd_data);
+	}
+
+}
+
+string receiveMessageFromServer(int client_socket) {
+	char rcv_data[1024] = "";
+	recv(client_socket, rcv_data, 1024, 0);
+	return string(rcv_data);
 }
 
 string sendMessageToServer(string snd_data) {
@@ -99,17 +130,38 @@ string sendMessageToServer(string snd_data) {
 	} else {
 		snd_data += CRLF;
 		int bytes_sent = send(client_socket, snd_data.c_str(), snd_data.length(), MSG_DONTWAIT);
-		char rcv_data[1024] = "";
-		recv(client_socket, rcv_data, 1024, 0);
-		cout << requestInput(string("ftp >> ") + string(rcv_data));
-		return string(rcv_data);
+		string rcv_data = receiveMessageFromServer(client_socket);
+		handleRcvData(rcv_data, snd_data);
+		return rcv_data;
 	}
 	
 }
 
+string extractEpsvPort(string response) {
+	if (!hasResponseCode(response.c_str(), "229")) return "";
+	regex reg("229 Entering Extended Passive Mode \\(\\|\\|\\|([0-9]+)\\|\\)");
+	smatch match;
+	string psv_port = "";
+	if(regex_search(response, match, reg)) {
+		psv_port = match[1];
+	}
+	return psv_port;
+}
+
+int epsv() {
+	string response = sendMessageToServer("EPSV");
+	string psv_port = extractEpsvPort(response);
+	if (psv_port.empty()) return 0;
+	int client_psv_socket;
+	sockaddr_in server_psv_socket;
+	string psv_server_addr = SERVER_ADDR;
+	int psv_server_port = stoi(psv_port);
+	setupSockets(&client_psv_socket, &server_psv_socket, psv_server_addr, psv_server_port);
+	return (connectToServerSocket(client_psv_socket, server_psv_socket)) ? client_psv_socket : 0;
+}
+
 void pwd() {
 	string response = sendMessageToServer("PWD");
-	
 }
 
 void cwd() {
@@ -117,7 +169,18 @@ void cwd() {
 }
 
 void list() {
+	int client_psv_socket = epsv();
+	if (client_psv_socket) {
+		string response = sendMessageToServer("LIST");
+		if (hasResponseCode(response.c_str(), "150")) {
+			string rcv_data = receiveMessageFromServer(client_psv_socket);
+			cout << "Received Data: " << endl << rcv_data << endl;
+			close(client_psv_socket);
 
+			string trans_complete = receiveMessageFromServer(client_socket);
+			cout << "Trans Complete: " << trans_complete << endl;
+		}
+	}
 }
 
 void retr() {
@@ -135,23 +198,27 @@ void quit() {
 	exit(0);
 }	
 
-void connect() {
-	cout << "Enter FTP Server Address: ";
-	string server_addr = SERVER_ADDR;
+void setupSockets(int *client_socket, sockaddr_in *server_socket, string server_addr, int server_port) {
 	string server_ip; server_ip = getServerIp(server_addr);
-	int server_port = 21;
-	cout << "Connecting to " << server_addr;
-	cout << " at IP: " << server_ip; 
-	cout << " Port: " << server_port << endl;
-	client_socket = createMySocket();
-	sockaddr_in server_socket = setupServerSocket(server_port, server_ip);
+	*client_socket = createMySocket();
+	*server_socket = setupServerSocket(server_port, server_ip);
+}
+
+void connect() {
+	string server_addr = SERVER_ADDR;
+	sockaddr_in server_socket;
+	setupSockets(&client_socket, &server_socket, server_addr, 21);
 	if(connectToFtpServer(client_socket, server_socket)) {
 		connected_server = server_addr;
 		sendMessageToServer("USER anonymous");
-		cout << requestInput("NUS Email: ");
-		string email; cin >> email;
+		if(email.empty()) {
+			cout << requestInput("NUS Email: ");
+			cin >> email;
+		}
 		sendMessageToServer("PASS " + email);
-	};
+	} else {
+		cout << "Failed to connect to FTP Server" << endl;
+	}
 }
 
 void invalid(int command) {
